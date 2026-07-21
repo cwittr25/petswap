@@ -1,0 +1,257 @@
+"""
+Real scraper against StarPets' actual backend API (confirmed live 2026-07-21):
+    POST https://market.apineural.com/api/v2/store/items/all
+    body: {"filter":{"types":[{"type":"<TYPE>"}]},"page":N,"amount":20,
+           "currency":"usd","sort":{"popularity":"desc"}}
+
+This is the same endpoint the public site itself calls for every visitor --
+not the robots-disallowed /api/docs/ dev endpoint, which this script does
+NOT touch.
+
+WHAT THE DATA ACTUALLY LOOKS LIKE:
+Each returned "item" is one individual marketplace LISTING, not one row per
+pet. The same pet shows up many times (different sellers, different neon
+stage, different fly/ride status). `count` for the "pet" type alone is
+39,226. So the job here is: walk every listing, group by
+(realName, pumping, flyable, rideable), and keep the MINIMUM price seen per
+group -- that's the real "buy it now" market value for that exact variant.
+
+PAGINATION: COMPLETE TRAVERSAL, NO SHORTCUTS.
+An earlier version of this script tried to stop early once new-variant
+sightings tapered off. That's wrong for this data: results are sorted by
+price, so cheap common pets get traversed first and expensive rare
+variants (the ones that matter most for big trades) sit at the far end of
+the list. Stopping early risks silently missing exactly the high-value
+items a trade calculator most needs to get right. So this version walks
+every page until the API returns an empty page, full stop -- no cap, no
+early exit. It DOES try a larger page size first (100 instead of 20) to
+cut the number of requests, falling back to 20 only if that's rejected.
+
+Confirmed: repo is public, so GitHub Actions minutes are unlimited --
+a longer, complete run is the right tradeoff over a fast, incomplete one.
+
+CATEGORY TYPES:
+Confirmed live 2026-07-21: pet, egg, transport (vehicles), potion,
+stroller, toy. Still guessed: pet_wear, food, sticker, gift -- script
+prints which of those return zero results so we know which are wrong.
+
+DATA QUALITY NOTE:
+StarPets appears to have a $0.04 minimum listing price -- lots of
+low-tier potions/toys/strollers all show exactly 0.04. That's a platform
+floor, not real value differentiation, so for cheap items StarPets'
+45% weight will often contribute a tie/flat value. AMVGG and Elvebredd's
+demand/rank data end up doing most of the differentiating work at the
+low end -- expected behavior, not a scraper bug.
+"""
+import json
+import time
+import requests
+
+API_URL = "https://market.apineural.com/api/v2/store/items/all"
+
+HEADERS = {
+    "accept": "*/*",
+    "content-type": "application/json",
+    "origin": "https://starpets.gg",
+    "referer": "https://starpets.gg/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+}
+
+# StarPets type -> PetSwap category key.
+# Confirmed live 2026-07-21: pet, egg, transport, potion, stroller, toy,
+# petwear, gift. Confirmed NOT sold on StarPets at all: food, stickers --
+# those categories are sourced from AMVGG/Elvebredd only; blend.py already
+# handles a missing source by redistributing weight, so this is fine.
+CATEGORY_TYPES = {
+    "pet": "pets",
+    "egg": "eggs",
+    "transport": "vehicles",
+    "potion": "potions",
+    "stroller": "strollers",
+    "toy": "toys",
+    "petwear": "petwear",   # NOT "pet_wear" -- caught from live response
+    "gift": "gifts",
+    # "sticker" / "food" intentionally omitted -- not sold on StarPets
+}
+
+CANDIDATE_PAGE_SIZE = 100  # tried first to cut request count; falls back to 20
+REQUEST_DELAY_SECONDS = 0.2  # polite pacing -- public API, but still not a good citizen to hammer it
+
+
+def fetch_page(item_type: str, page: int, amount: int, sort_key="popularity", sort_dir="desc") -> dict:
+    body = {
+        "filter": {"types": [{"type": item_type}]},
+        "page": page,
+        "amount": amount,
+        "currency": "usd",
+        "sort": {sort_key: sort_dir},
+    }
+    resp = requests.post(API_URL, headers=HEADERS, json=body, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def determine_page_size(item_type: str) -> int:
+    """Try the larger page size once; fall back to the confirmed-working 20
+    if the API rejects it or silently caps the response."""
+    try:
+        data = fetch_page(item_type, 1, CANDIDATE_PAGE_SIZE)
+        if data.get("status") and len(data.get("items", [])) > 20:
+            return CANDIDATE_PAGE_SIZE
+    except Exception:
+        pass
+    return 20
+
+
+def variant_key(item: dict):
+    return (item["realName"], item["pumping"], item["flyable"], item["rideable"])
+
+
+def scrape_type(item_type: str, category_key: str) -> list[dict]:
+    display_name = {}  # realName -> human name (for output)
+
+    page_size = determine_page_size(item_type)
+
+    first_page = fetch_page(item_type, 1, page_size)
+    if not first_page.get("status") or not first_page.get("items"):
+        print(f"  [warn] '{item_type}' returned nothing -- likely a wrong type value")
+        return []
+
+    total_count = first_page.get("count", 0)
+    expected_pages = -(-total_count // page_size) if total_count else "?"
+    print(f"  total listings reported: {total_count} | page size: {page_size} "
+          f"| expected ~{expected_pages} pages | walking ALL of them, no early stop")
+
+    page = 1
+    seen_listing_ids = set()  # dedupe safety net in case pagination ever overlaps
+    prices_by_key = {}   # variant_key -> [all prices seen] -- median taken after full traversal
+    sample_by_key = {}   # variant_key -> one representative item (for image/rarity/name)
+    while True:
+        data = first_page if page == 1 else fetch_page(item_type, page, page_size)
+        items = data.get("items", [])
+        if not items:
+            break
+
+        for it in items:
+            if it["id"] in seen_listing_ids:
+                continue
+            seen_listing_ids.add(it["id"])
+            k = variant_key(it)
+            display_name[it["realName"]] = it["name"]
+            prices_by_key.setdefault(k, []).append(it["price"])
+            sample_by_key.setdefault(k, it)  # first-seen sample is fine for display fields
+
+        if page % 100 == 0:
+            print(f"    ...page {page}, {len(seen_listing_ids)} listings seen, "
+                  f"{len(prices_by_key)} unique variants so far")
+
+        page += 1
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    print(f"  -> COMPLETE: {len(seen_listing_ids)} listings across {page - 1} pages, "
+          f"{len(prices_by_key)} unique (pet, variant) combos")
+
+    def median(vals):
+        s = sorted(vals)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+    out = []
+    for k, prices in prices_by_key.items():
+        real_name, pumping, flyable, rideable = k
+        item = sample_by_key[k]
+        out.append({
+            "name": display_name[real_name],
+            "category": category_key,
+            "value": round(median(prices), 4),  # MEDIAN across all listings for this variant
+            "listing_count": len(prices),         # transparency: how many listings backed this median
+            "image": item["imageUri"],
+            "rarity": item.get("rare"),
+            "pumping": pumping,      # default / neon / mega_neon
+            "flyable": flyable,
+            "rideable": rideable,
+            "source": "starpets",
+        })
+    return out
+
+
+def main():
+    all_items = []
+    for item_type, category_key in CATEGORY_TYPES.items():
+        print(f"Scraping StarPets type='{item_type}' -> {category_key} ...")
+        try:
+            all_items.extend(scrape_type(item_type, category_key))
+        except Exception as e:
+            print(f"  [error] {item_type}: {e}")
+        time.sleep(1)
+
+    with open("scraped_starpets_raw.json", "w", encoding="utf-8") as f:
+        json.dump(all_items, f, indent=2)
+    print(f"\nWrote {len(all_items)} raw (pet, variant) rows to scraped_starpets_raw.json")
+
+    reduce_to_base_and_multipliers(all_items)
+
+
+def reduce_to_base_and_multipliers(items: list[dict]):
+    from collections import defaultdict
+    groups = defaultdict(dict)  # (category, name) -> {variant_tag: price}
+
+    for it in items:
+        tag = "base"
+        if it["pumping"] == "neon":
+            tag = "neon"
+        elif it["pumping"] == "mega_neon":
+            tag = "mega"
+        if it["pumping"] == "default" and it["flyable"] and it["rideable"]:
+            tag = "flyride"
+        elif it["pumping"] == "default" and it["flyable"]:
+            tag = "fly"
+        elif it["pumping"] == "default" and it["rideable"]:
+            tag = "ride"
+
+        key = (it["category"], it["name"])
+        if tag not in groups[key] or it["value"] < groups[key][tag]:
+            groups[key][tag] = it["value"]
+
+    base_items = []
+    ratios = {"neon": [], "mega": [], "fly": [], "ride": [], "flyride": []}
+
+    for (category, name), variants in groups.items():
+        if "base" not in variants:
+            continue  # can't establish a base value for this item this run
+        base_price = variants["base"]
+        base_items.append({
+            "name": name,
+            "category": category,
+            "value": base_price,
+            "source": "starpets",
+        })
+        for tag in ratios:
+            if tag in variants and base_price > 0:
+                ratios[tag].append(variants[tag] / base_price)
+
+    def median(vals):
+        if not vals:
+            return None
+        s = sorted(vals)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+    measured_multipliers = {tag: median(vals) for tag, vals in ratios.items()}
+    print("\nMeasured variant multipliers this run (sample sizes in parens):")
+    for tag, vals in ratios.items():
+        m = measured_multipliers[tag]
+        print(f"  {tag}: {round(m, 3) if m else 'n/a'}  (n={len(vals)})")
+
+    with open("scraped_starpets.json", "w", encoding="utf-8") as f:
+        json.dump(base_items, f, indent=2)
+    with open("starpets_measured_multipliers.json", "w", encoding="utf-8") as f:
+        json.dump(measured_multipliers, f, indent=2)
+    print(f"\nWrote {len(base_items)} base-value items to scraped_starpets.json")
+    print("(measured multipliers saved to starpets_measured_multipliers.json --")
+    print(" not yet auto-applied to VARIANT_MULTIPLIERS in data.js; review before wiring in)")
+
+
+if __name__ == "__main__":
+    main()
